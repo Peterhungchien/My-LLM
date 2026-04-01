@@ -64,3 +64,88 @@ After selecting the top pair (e.g. `"e"` + `"r"`), you must rewrite every occurr
 Naive BPE is expensive: each iteration scans the full corpus to recount pairs and rewrites all occurrences — O(corpus size) per merge, repeated thousands of times.
 
 **Question:** what could you precompute or cache to avoid rescanning the entire corpus from scratch each iteration?
+
+---
+
+## Tokenizer training vs. model training
+
+**Q: Can you train BPE incrementally, streaming through the corpus one document at a time?**
+
+A: No. BPE needs global pair frequency counts before making any merge decision. You must have access to the full corpus upfront to know which pair is most frequent. There is no principled way to make merge decisions incrementally.
+
+**Q: So tokenizer training and model training are completely separate phases?**
+
+A: Yes. BPE tokenizer training is a one-time, offline preprocessing step. The resulting merge rules are then frozen and used to tokenize all future data.
+
+| | Tokenizer training | Model training |
+|---|---|---|
+| Data access | Full corpus, random access | Streaming OK |
+| Run frequency | Once, frozen forever | Iterated over many epochs |
+| Corpus size | Can be a curated sample | As large as possible |
+
+**Q: What happens if `max_vocab_size` is set too large for the corpus?**
+
+A: BPE terminates early — once no pair appears more than once, there is nothing left to merge. You end up with long substring tokens covering the corpus, which is useless. Vocab size must be chosen relative to corpus size; typical values (32k–100k) require a large, diverse corpus.
+
+---
+
+## Special tokens
+
+**Q: Do we need to insert `<|endoftext|>` when training the tokenizer?**
+
+A: No. BPE only needs raw text to count pair frequencies — document boundaries are irrelevant. Special tokens are only needed during LLM pre-training, where documents are packed end-to-end and boundaries must be marked.
+
+**Q: So how does the tokenizer know to treat `<|endoftext|>` as a single token and never split it?**
+
+A: Special tokens are manually appended to the vocabulary *after* BPE training. A regex pre-tokenization step then matches and splits them out before BPE runs, so they are always treated as indivisible units. BPE merge rules never touch them.
+
+The vocabulary therefore has two distinct parts:
+- **Learned vocab:** initial characters/bytes + all merged subword tokens from BPE
+- **Special tokens:** `<|endoftext|>`, `<|pad|>`, `<|user|>`, etc. — appended afterward, atomic by definition
+
+---
+
+## Why documents are concatenated during pre-training
+
+**Q: Why not feed each document separately to the model during pre-training?**
+
+A: GPU utilization. Neural network training requires fixed-length batches. A 200-token document in a 2048-token context window wastes 1848 positions on padding — compute spent on nothing. By packing documents end-to-end and chopping into fixed-length chunks, every token position carries real gradient signal.
+
+**Q: But doesn't that corrupt the model — training it to predict across document boundaries?**
+
+A: Yes, which is why `<|endoftext|>` is inserted at each boundary. The model learns to treat it as a hard reset. A cleaner but more expensive alternative is to mask attention across document boundaries:
+
+| Approach | GPU utilization | Cross-doc contamination |
+|---|---|---|
+| Feed separately with padding | Poor | None |
+| Concatenate + `<|endoftext|>` | Full | Model learns to ignore boundary |
+| Concatenate + masked attention | Full | None |
+
+Most large-scale pre-training (GPT, LLaMA) uses the middle approach.
+
+---
+
+## Pre-tokenization
+
+**Q: How do we split text into units before BPE runs? Naive space-splitting seems fragile.**
+
+A: A hand-crafted **regex pre-tokenization step** splits text into chunks before BPE sees it. BPE merges only happen *within* each chunk, never across them — this prevents tokens from spanning what should be word boundaries.
+
+**Q: What does GPT-2's regex actually capture?**
+
+A: It splits on:
+- Contractions: `'s`, `'t`, `'re`, ...
+- Words with an optional **leading space attached** (` hello` is one chunk, not `" "` + `"hello"`)
+- Numbers
+- Punctuation / symbol runs
+- Whitespace runs
+
+Attaching the leading space to the following word means the vocabulary distinguishes `"hello"` (start of text) from `" hello"` (mid-sentence). This is why GPT-2's vocabulary has the `Ġ` prefix on many tokens.
+
+**Q: What about languages without spaces, or code, or ASCII art?**
+
+A: This is the core limitation. Pre-tokenization rules embed assumptions about what a "word" is and behave poorly on languages like Chinese, Japanese, or Thai, and on edge cases like ASCII art or dense code. Newer tokenizers (tiktoken's cl100k) use more sophisticated regex patterns; some research explores *learning* pre-tokenization rules rather than hand-crafting them.
+
+**Q: How does GPT-2 handle rare Unicode characters or unseen scripts without an OOV problem?**
+
+A: By operating on **bytes**, not characters. The base vocabulary is the 256 possible byte values, guaranteeing any Unicode text is representable. BPE then merges bytes into longer subword sequences. This is called byte-level BPE.
